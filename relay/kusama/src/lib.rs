@@ -674,6 +674,57 @@ impl pallet_bags_list::Config<VoterBagsListInstance> for Runtime {
 	type Score = sp_npos_elections::VoteWeight;
 }
 
+use frame_support::dynamic_params::{dynamic_pallet_params, dynamic_params};
+#[dynamic_params(RuntimeParameters, pallet_parameters::Parameters::<Runtime>)]
+pub mod kusama_params {
+	use super::*;
+
+	#[dynamic_pallet_params]
+	#[codec(index = 0)]
+	pub mod staking {
+		use super::*;
+
+		/// The amount that we wish to see staked ideally.
+		///
+		/// In a model where something like auctions exist, this should merely be "ideal -
+		/// expected-to-be-in-auctions".
+		#[codec(index = 0)]
+		pub static IdealStakingRate: Perquintill = Perquintill::from_percent(75);
+
+		/// The maximum amount of inflation that we are willing to have. If the [`IdealStakingRate`]
+		/// is exactly met, this is the inflation amount.
+		#[codec(index = 1)]
+		pub static MaxInflation: Perquintill = Perquintill::from_percent(10);
+
+		#[codec(index = 2)]
+		pub static MinInflation: Perquintill = Perquintill::from_rational(25u64, 1000);
+
+		/// How much of the total inflation goes to the staking pallet as validator payout.
+		#[codec(index = 3)]
+		pub static StakingInflation: Perquintill = Perquintill::from_percent(90);
+
+		/// If [`StakingInflation`] is not 100%, what do we do with the rest?
+		///
+		/// For now, we allocate all leftovers to the treasury account.
+		pub static Leftovers: Vec<(AccountId, Perquintill)> =
+			vec![(Treasury::account_id(), Perquintill::from_percent(100))];
+	}
+}
+
+use kusama_params::*;
+
+pub struct Manager;
+impl frame_support::traits::EnsureOriginWithArg<RuntimeOrigin, RuntimeParametersKey> for Manager {
+	type Success = ();
+
+	fn try_origin(
+		o: RuntimeOrigin,
+		a: &RuntimeParametersKey,
+	) -> Result<Self::Success, RuntimeOrigin> {
+		todo!();
+	}
+}
+
 pub struct EraPayout;
 impl pallet_staking::EraPayout<Balance> for EraPayout {
 	fn era_payout(
@@ -700,6 +751,45 @@ impl pallet_staking::EraPayout<Balance> for EraPayout {
 			auctioned_slots,
 		)
 	}
+}
+
+pub fn era_payout(
+	total_staked: Balance,
+	total_stakable: Balance,
+	max_annual_inflation: Perquintill,
+	period_fraction: Perquintill,
+	auctioned_slots: u64,
+) -> (Balance, Balance) {
+	use pallet_staking_reward_fn::compute_inflation;
+	use sp_runtime::traits::Saturating;
+
+	let min_annual_inflation = Perquintill::from_rational(25u64, 1000u64);
+	let delta_annual_inflation = max_annual_inflation.saturating_sub(min_annual_inflation);
+
+	// 30% reserved for up to 60 slots.
+	let auction_proportion = Perquintill::from_rational(auctioned_slots.min(60), 200u64);
+
+	// Therefore the ideal amount at stake (as a percentage of total issuance) is 75% less the
+	// amount that we expect to be taken up with auctions.
+	let ideal_stake = Perquintill::from_percent(75).saturating_sub(auction_proportion);
+
+	let stake = Perquintill::from_rational(total_staked, total_stakable);
+	let falloff = Perquintill::from_percent(5);
+	let adjustment = compute_inflation(stake, ideal_stake, falloff);
+	let staking_inflation =
+		min_annual_inflation.saturating_add(delta_annual_inflation * adjustment);
+
+	let max_payout = period_fraction * max_annual_inflation * total_stakable;
+	let staking_payout = (period_fraction * staking_inflation) * total_stakable;
+	let rest = max_payout.saturating_sub(staking_payout);
+
+	let other_issuance = total_stakable.saturating_sub(total_staked);
+	if total_staked > other_issuance {
+		let _cap_rest = Perquintill::from_rational(other_issuance, total_staked) * staking_payout;
+		// We don't do anything with this, but if we wanted to, we could introduce a cap on the
+		// treasury amount with: `rest = rest.min(cap_rest);`
+	}
+	(staking_payout, rest)
 }
 
 parameter_types! {
