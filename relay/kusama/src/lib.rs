@@ -142,6 +142,8 @@ use governance::{
 	Treasurer, TreasurySpender,
 };
 
+pub mod inflation;
+
 // Implemented types.
 pub mod impls;
 
@@ -681,7 +683,7 @@ pub mod kusama_params {
 
 	#[dynamic_pallet_params]
 	#[codec(index = 0)]
-	pub mod staking {
+	pub mod inflation {
 		use super::*;
 
 		/// The amount that we wish to see staked ideally.
@@ -699,22 +701,27 @@ pub mod kusama_params {
 		#[codec(index = 2)]
 		pub static MinInflation: Perquintill = Perquintill::from_rational(25u64, 1000);
 
-		/// How much of the total inflation goes to the staking pallet as validator payout.
+		/// How fast do we want to react inefficiencies of [`IdealStakingRate`]?
 		#[codec(index = 3)]
-		pub static StakingInflation: Perquintill = Perquintill::from_percent(90);
+		pub static Falloff: Perquintill = Perquintill::from_percent(5);
 
-		/// If [`StakingInflation`] is not 100%, what do we do with the rest?
-		///
-		/// For now, we allocate all leftovers to the treasury account.
-		pub static Leftovers: Vec<(AccountId, Perquintill)> =
-			vec![(Treasury::account_id(), Perquintill::from_percent(100))];
+		/// A fixed percentage of the inflation that is given to the [`LeftoverRecipients`]
+		#[codec(index = 3)]
+		pub static FixedGiveaway: Perquintill = Perquintill::from_percent(20);
+
+		/// What we do with the inflation.
+		#[codec(index = 5)]
+		pub static LeftoverRecipients: Vec<(AccountId, Perquintill)> =
+			vec![(Treasury::account_id(), Perquintill::from_percent(20))];
 	}
 }
 
 use kusama_params::*;
 
-pub struct Manager;
-impl frame_support::traits::EnsureOriginWithArg<RuntimeOrigin, RuntimeParametersKey> for Manager {
+pub struct ParametersAdmin;
+impl frame_support::traits::EnsureOriginWithArg<RuntimeOrigin, RuntimeParametersKey>
+	for ParametersAdmin
+{
 	type Success = ();
 
 	fn try_origin(
@@ -725,32 +732,57 @@ impl frame_support::traits::EnsureOriginWithArg<RuntimeOrigin, RuntimeParameters
 	}
 }
 
-pub struct EraPayout;
-impl pallet_staking::EraPayout<Balance> for EraPayout {
+pub struct StakingEraPayout;
+impl pallet_staking::EraPayout<Balance> for StakingEraPayout {
 	fn era_payout(
 		total_staked: Balance,
 		_total_issuance: Balance,
 		era_duration_millis: u64,
 	) -> (Balance, Balance) {
-		// all para-ids that are currently active.
-		let auctioned_slots = Paras::parachains()
-			.into_iter()
-			// all active para-ids that do not belong to a system chain is the number
-			// of parachains that we should take into account for inflation.
-			.filter(|i| *i >= LOWEST_PUBLIC_ID)
-			.count() as u64;
+		// how much of the issuance is stake-able? In Kusama, because of Nis this is not
+		// `total_issuance`.
+		let adjusted_total_issuance = Nis::issuance().other;
 
-		const MAX_ANNUAL_INFLATION: Perquintill = Perquintill::from_percent(10);
+		// duration of this era against a full year.
 		const MILLISECONDS_PER_YEAR: u64 = 1000 * 3600 * 24 * 36525 / 100;
+		let era_annual_proportion =
+			Perquintill::from_rational(era_duration_millis, MILLISECONDS_PER_YEAR);
 
-		runtime_common::impls::era_payout(
-			total_staked,
-			Nis::issuance().other,
-			MAX_ANNUAL_INFLATION,
-			Perquintill::from_rational(era_duration_millis, MILLISECONDS_PER_YEAR),
-			auctioned_slots,
-		)
+		let min_annual_inflation = kusama_params::inflation::MinInflation::get();
+		let max_annual_inflation = kusama_params::inflation::MaxInflation::get();
+		let delta_annual_inflation = max_annual_inflation.saturating_sub(min_annual_inflation);
+		let ideal_stake = kusama_params::inflation::IdealStakingRate::get();
+
+		let stake = Perquintill::from_rational(total_staked, adjusted_total_issuance);
+		let falloff = kusama_params::inflation::Falloff::get();
+
+		let adjustment = compute_inflation(stake, ideal_stake, falloff);
+		let staking_annual_inflation: Perquintill =
+			min_annual_inflation.saturating_add(delta_annual_inflation * adjustment);
+
+		// final inflation formula.
+		let payout_with_annual_inflation = |i| era_annual_proportion * i * adjusted_total_issuance;
+
+		// ideal amount that we want to payout.
+		let max_payout = payout_with_annual_inflation(max_annual_inflation);
+		let staking_payout = payout_with_annual_inflation(staking_annual_inflation);
+
+		let leftover_inflation = max_payout.saturating_add(staking_payout);
+		kusama_params::inflation::Leftovers::get()
+			.into_iter()
+			.for_each(|(who, proportion)| {
+				let amount = leftover_inflation * proportion;
+				// not much we can do about errors here.
+				let _ = Balances::mint_into(who, amount).defensive();
+			});
 	}
+}
+
+impl pallet_parameters::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type RuntimeParameters = RuntimeParameters;
+	type AdminOrigin = ParametersAdmin;
+	type WeightInfo = ();
 }
 
 pub fn era_payout(
@@ -1806,6 +1838,8 @@ construct_runtime! {
 		// Fast unstake pallet: extension to staking.
 		FastUnstake: pallet_fast_unstake = 42,
 
+		Parameters: pallet_parameters = 9,
+
 		// Parachains pallets. Start indices at 50 to leave room.
 		ParachainsOrigin: parachains_origin = 50,
 		Configuration: parachains_configuration = 51,
@@ -2145,6 +2179,7 @@ mod benches {
 		[pallet_multisig, Multisig]
 		[pallet_nomination_pools, NominationPoolsBench::<Runtime>]
 		[pallet_offences, OffencesBench::<Runtime>]
+		[pallet_parameters, Parameters]
 		[pallet_preimage, Preimage]
 		[pallet_proxy, Proxy]
 		[pallet_ranked_collective, FellowshipCollective]
